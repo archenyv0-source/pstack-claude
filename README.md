@@ -13,7 +13,7 @@ For concurrency bugs and invariants that tests cannot reach, see the separate [a
 Run in Claude Code:
 
 ```text
-/plugin marketplace add michael-denyer/pstack-claude
+/plugin marketplace add archenyv0-source/pstack-claude
 /plugin install pstack@pstack-claude
 ```
 
@@ -22,7 +22,7 @@ Run in Claude Code:
 Run in your terminal:
 
 ```shell
-codex plugin marketplace add michael-denyer/pstack-claude
+codex plugin marketplace add archenyv0-source/pstack-claude
 codex plugin add pstack@pstack-claude
 ```
 
@@ -31,7 +31,7 @@ codex plugin add pstack@pstack-claude
 Run in your terminal:
 
 ```shell
-pi install git:github.com/michael-denyer/pstack-claude
+pi install git:github.com/archenyv0-source/pstack-claude
 ```
 
 The package loads the skills and the pstack Pi extension, which adds the subagent, question, and wake-up tools the skills use, plus `/loop` and the routing instruction. Invoke a skill with `/skill:<name>`.
@@ -69,4 +69,4 @@ Thanks for helping make this port better. Bug reports, documentation fixes, and 
 
 ## License
 
-This port, including its modifications and additions, is also [MIT-licensed](LICENSE), © 2026 Michael Denyer. Original pstack © 2026 Lauren Tan; imported cursor-team-kit skills © 2026 Cursor. See [LICENSE-cursor-team-kit](LICENSE-cursor-team-kit) and [NOTICE.md](NOTICE.md).
+This port, including its modifications and additions, is also [MIT-licensed](LICENSE). This fork © 2026 archenyv0-source; the [upstream port](https://github.com/michael-denyer/pstack-claude) © 2026 Michael Denyer. Original pstack © 2026 Lauren Tan; imported cursor-team-kit skills © 2026 Cursor. See [LICENSE-cursor-team-kit](LICENSE-cursor-team-kit) and [NOTICE.md](NOTICE.md).

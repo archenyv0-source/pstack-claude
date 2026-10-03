@@ -1,6 +1,6 @@
 # NOTICE
 
-This plugin is a port of upstream MIT-licensed work. The port's modifications and additions are (c) 2026 Michael Denyer and are also released under the [MIT license](LICENSE). All upstream copyright notices and license terms are preserved.
+This plugin is a port of upstream MIT-licensed work. The port's modifications and additions are (c) 2026 Michael Denyer ([michael-denyer/pstack-claude](https://github.com/michael-denyer/pstack-claude)). This fork's further modifications and additions are (c) 2026 archenyv0-source. Both are released under the [MIT license](LICENSE). All upstream copyright notices and license terms are preserved.
 
 ## Upstream sources
 
