@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 
 import { openingPrompt } from "../../plugins/pstack/skills/reflect/scripts/find-transcript.mjs";
 import { agentBody, alive as pidAlive, gitRepo, pluginRoot, readEntries, sleep } from "./harness.mjs";
-import { agentByDescription, assistantModels, childEntries, descendants, jsonLines, liveModels, MINUTE, PiRpc, processTable, sections, textOf } from "./live-harness.mjs";
+import { agentByDescription, assistantModels, childEntries, descendants, findSessionFile, jsonLines, liveModels, MINUTE, PiRpc, processTable, sections, textOf } from "./live-harness.mjs";
 
 const LIVE = process.env.PSTACK_PI_LIVE === "1";
 const repoRoot = fileURLToPath(new URL("../../", import.meta.url));
@@ -48,10 +48,7 @@ async function withParent(fn) {
 }
 
 function parentSessionFile(sessionId) {
-  const dir = join(agentDir, "sessions");
-  const files = readdirSync(dir, { recursive: true }).filter((f) => f.endsWith(`_${sessionId}.jsonl`));
-  expect(files).toHaveLength(1);
-  return join(dir, files[0]);
+  return findSessionFile(join(agentDir, "sessions"), sessionId);
 }
 
 const suite = LIVE ? describe : describe.skip;
@@ -66,7 +63,6 @@ suite("pstack on live pi", () => {
     mkdirSync(work);
     symlinkSync(join(homedir(), ".pi", "agent", "auth.json"), join(agentDir, "auth.json"));
     env = { ...process.env, PI_CODING_AGENT_DIR: agentDir, PI_TELEMETRY: "0" };
-    delete env.PSTACK_PI_DEPTH;
     const install = spawnSync("pi", ["install", repoRoot], { cwd: work, env, encoding: "utf8" });
     if (install.status !== 0) throw new Error(`pi install failed: ${install.stderr}`);
     // Keep no recent tokens so a two-turn session is big enough to compact.
@@ -94,6 +90,8 @@ suite("pstack on live pi", () => {
   test(
     "panel: three background agents on opus, fable, and sonnet each notify, on their own resolved model",
     async () => {
+      // An agent that ignored its model would run on the parent's, so one alias must resolve elsewhere.
+      expect(["opus", "fable", "sonnet"].some((alias) => MODELS.get(alias) !== PARENT_MODEL)).toBe(true);
       await withParent(async (parent) => {
         const from = await parent.run(
           [
@@ -111,7 +109,8 @@ suite("pstack on live pi", () => {
         const expected = { "panel-opus": ["opus", "alpha"], "panel-fable": ["fable", "beta"], "panel-sonnet": ["sonnet", "gamma"] };
         const notices = parent.notices(from);
         expect(notices).toHaveLength(3);
-        const seen = new Set();
+        // Each agent's own model is checked; a provider's table may map two
+        // aliases to one model, as openai does for opus and sonnet.
         for (const [description, [alias, word]] of Object.entries(expected)) {
           const snaps = agentByDescription(file, description);
           const last = snaps.at(-1);
@@ -125,9 +124,7 @@ suite("pstack on live pi", () => {
           const childSections = sections(child);
           expect(childSections[SHEET_KEY]).toBe(tagged(SHEET_KEY, SHEET));
           expect(childSections[MANDATE_KEY]).toBeUndefined();
-          seen.add(MODELS.get(alias));
         }
-        expect(seen.size).toBe(3);
       });
     },
     8 * MINUTE,
@@ -247,19 +244,19 @@ suite("pstack on live pi", () => {
   );
 
   test(
-    "effort: pstack:effort-high runs the child at thinking high with the effort agent as its system prompt",
+    "effort: the effort parameter runs a pstack:poteto-agent child at thinking high with the poteto-agent body as its system prompt",
     async () => {
       await withParent(async (parent) => {
         await parent.run(
-          'Make one agent tool call in the foreground with subagent_type "pstack:effort-high", description "effort", prompt "Reply with exactly one word: done". Then reply with exactly one word: ok.',
+          'Make one agent tool call in the foreground with subagent_type "pstack:poteto-agent", effort "high", description "effort", prompt "Reply with exactly one word: done". Then reply with exactly one word: ok.',
         );
         const record = agentByDescription(await parent.sessionFile(), "effort").at(-1);
-        expect(record).toMatchObject({ status: "completed", agent: { subagentType: "pstack:effort-high", thinking: "high" } });
+        expect(record).toMatchObject({ status: "completed", agent: { subagentType: "pstack:poteto-agent", thinking: "high" } });
         const child = childEntries(record);
         const levels = child.filter((e) => e.type === "thinking_level_change").map((e) => e.thinkingLevel);
         expect(levels.at(-1)).toBe("high");
         const childSections = sections(child);
-        expect(childSections.addendum).toContain(agentBody("effort-agents/effort-high.md"));
+        expect(childSections.addendum).toContain(agentBody("agents/poteto-agent.md"));
         expect(childSections[SHEET_KEY]).toBe(tagged(SHEET_KEY, SHEET));
         expect(childSections[MANDATE_KEY]).toBeUndefined();
       });
@@ -305,7 +302,7 @@ suite("pstack on live pi", () => {
   );
 
   test(
-    "wake: schedule_wakeup re-invokes the parent with the stored prompt after 60 s",
+    "wake: schedule_wakeup re-invokes the parent with the stored prompt after 60 s, as a custom message, not a user message",
     async () => {
       await withParent(async (parent) => {
         const wakePrompt = "WAKE-PING: reply with exactly one word: pong";
@@ -315,7 +312,7 @@ suite("pstack on live pi", () => {
         const [scheduled] = parent.toolResults("schedule_wakeup", from);
         expect(scheduled.details.delaySeconds).toBe(60);
         const fired = await parent.until(
-          () => parent.messages(from).find((m) => m.role === "user" && textOf(m) === wakePrompt),
+          () => parent.messages(from).find((m) => m.role === "custom" && m.customType === "pstack-wakeup" && textOf(m) === wakePrompt),
           2 * MINUTE,
           "the wakeup prompt",
         );
@@ -410,7 +407,10 @@ suite("pstack on live pi", () => {
           encoding: "utf8",
         });
         expect({ cwd, code: run.status, stderr: run.status === 0 ? "" : run.stderr }).toEqual({ cwd, code: 0, stderr: "" });
-        const events = run.stdout.split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l));
+        const events = [];
+        const lines = jsonLines((e) => events.push(e));
+        lines.write(run.stdout);
+        lines.end();
         const entries = readEntries(parentSessionFile(events.find((e) => e.type === "session").id));
         const system = entries.find((e) => e.type === "message" && e.message.role === "system").message;
         const declared = system.toolsAdded.map((t) => t.name);
@@ -437,7 +437,7 @@ suite("pstack on live pi", () => {
       );
       const events = [];
       let stderr = "";
-      proc.stdout.on("data", jsonLines((e) => events.push(e)));
+      proc.stdout.on("data", jsonLines((e) => events.push(e)).write);
       proc.stderr.on("data", (d) => (stderr += d));
       const code = await new Promise((r) => proc.on("close", r));
       expect({ code, stderr: code === 0 ? "" : stderr }).toEqual({ code: 0, stderr: "" });

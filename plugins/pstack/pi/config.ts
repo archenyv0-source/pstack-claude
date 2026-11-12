@@ -1,25 +1,27 @@
-import { existsSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { type Static, Type } from "typebox";
 import { Value } from "typebox/value";
 
-const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
-type Effort = (typeof EFFORT_LEVELS)[number];
 const PARENT_MODEL_ALIASES = ["inherit-parent", "auto"];
 
 // A parent passes it to each agent it starts, so the agent knows its depth.
 export const DEPTH_FLAG = "pstack-depth";
+// Under agentDir, holds each session's agent sessions and prompts. The worktree
+// audit scans it by this name, so a rename must reach that script too.
+export const PSTACK_STATE_DIR = "pstack";
+// Under agentDir, beside the pstack-models.md sheet, holds the user's agent
+// files. Not Pi's `agents`, which other subagent extensions read with their
+// own frontmatter.
+export const USER_AGENTS_DIR = "pstack-agents";
 
 export interface Settings {
   pluginRoot: string;
   modelsFile: string;
   agentDir: string;
   pi: { command: string; args: string[] };
-  // Unset, so an agent inherits the session's environment. Tests set it to
-  // configure their fake pi.
-  childEnv?: NodeJS.ProcessEnv;
   // Layers below the main session: 0 there, 1 in its agents, and so on.
   readonly depth: number;
   killGraceMs: number;
@@ -41,12 +43,12 @@ function piInvocation(): Settings["pi"] {
 
 // readDepth is called on each use: pi parses extension flags after it loads
 // the extension.
-export function defaultSettings(readDepth: () => number, env: NodeJS.ProcessEnv = process.env): Settings {
+export function defaultSettings(readDepth: () => number, agentDir = process.env.PI_CODING_AGENT_DIR): Settings {
   const pluginRoot = join(dirname(fileURLToPath(import.meta.url)), "..");
   return {
     pluginRoot,
     modelsFile: join(pluginRoot, "models.json"),
-    agentDir: env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent"),
+    agentDir: agentDir || join(homedir(), ".pi", "agent"),
     pi: piInvocation(),
     get depth() {
       return readDepth();
@@ -59,11 +61,17 @@ export function defaultSettings(readDepth: () => number, env: NodeJS.ProcessEnv 
 interface Sheet {
   text: string;
   hookOff: boolean;
+  // Leaves ask_user_question to another extension: Pi refuses to start when two
+  // extensions register the same tool name.
+  askToolOff: boolean;
+  // Drops agent, send_message, list_agents, stop_agent and /pstack-agents for a
+  // profile that delegates through another extension, such as pi-subagents.
+  agentToolsOff: boolean;
   piModels: Map<string, string>;
 }
 
 export function parseSheet(text: string): Sheet {
-  const lines = text.split(/\r?\n/);
+  const lines = text.replace(/^\uFEFF/, "").split(/\r?\n/);
   const piModels = new Map<string, string>();
   for (const line of lines) {
     const m = /^pi models:\s*(.*)$/.exec(line.trim());
@@ -73,25 +81,56 @@ export function parseSheet(text: string): Sheet {
       if (alias && id) piModels.set(alias, id);
     }
   }
-  return { text, hookOff: lines.some((l) => l === "session hook: off"), piModels };
+  return {
+    text,
+    hookOff: lines.some((l) => l === "session hook: off"),
+    askToolOff: lines.some((l) => l === "pi ask tool: off"),
+    agentToolsOff: lines.some((l) => l === "pi agent tools: off"),
+    piModels,
+  };
 }
 
 export function readSheet(agentDir: string): Sheet | undefined {
-  const file = join(agentDir, "pstack-models.md");
-  return existsSync(file) ? parseSheet(readFileSync(file, "utf8")) : undefined;
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(join(agentDir, "pstack-models.md"));
+  } catch {
+    // An absent or unreadable sheet leaves the defaults in place, as the session hooks do.
+    return undefined;
+  }
+  // Windows PowerShell 5.1's `>` writes UTF-16 LE with a byte-order mark. A
+  // sheet that is not valid UTF-16 LE counts as absent, as in the session hooks.
+  if (bytes[0] !== 0xff || bytes[1] !== 0xfe) return parseSheet(bytes.toString("utf8"));
+  try {
+    // ignoreBOM keeps the byte-order mark, so parseSheet drops exactly one, as for
+    // UTF-8. A Node built without ICU throws here, and the sheet counts as absent.
+    return parseSheet(new TextDecoder("utf-16le", { fatal: true, ignoreBOM: true }).decode(bytes));
+  } catch {
+    return undefined;
+  }
 }
 
 // The parts of models.json the extension reads; the generator checks the rest.
 const modelsConfig = Type.Object({
   available: Type.Array(Type.String()),
+  efforts: Type.Array(Type.String()),
   pi: Type.Object({ fallback: Type.String(), models: Type.Record(Type.String(), Type.Record(Type.String(), Type.String())) }),
 });
 
 function readModels(modelsFile: string): Static<typeof modelsConfig> {
-  const raw: unknown = JSON.parse(readFileSync(modelsFile, "utf8"));
-  if (!Value.Check(modelsConfig, raw)) throw new Error(`${modelsFile} is not a pstack models file: it needs available[] and pi.{fallback, models}.`);
+  const text = readFileSync(modelsFile, "utf8");
+  let raw: unknown;
+  try {
+    raw = JSON.parse(text);
+  } catch (e) {
+    throw new Error(`${modelsFile} is not valid JSON: ${(e as Error).message}`);
+  }
+  if (!Value.Check(modelsConfig, raw)) throw new Error(`${modelsFile} is not a pstack models file: it needs available[], efforts[] and pi.{fallback, models}.`);
   return raw;
 }
+
+// A model or effort value that is not valid, unlike a models.json that cannot be read.
+export class InvalidValueError extends Error {}
 
 // Returns the provider/id for --model, or undefined when the child should run
 // on Pi's default because the parent model is unknown.
@@ -106,7 +145,7 @@ export function resolveModel(
   const models = readModels(settings.modelsFile);
   if (!models.available.includes(requested)) {
     const valid = [...models.available, ...PARENT_MODEL_ALIASES, "<provider>/<model-id>"];
-    throw new Error(`Unknown model "${requested}". Valid values: ${valid.join(", ")}.`);
+    throw new InvalidValueError(`Unknown model "${requested}". Valid values: ${valid.join(", ")}.`);
   }
   // Family names follow the provider the session is signed in to, so a ChatGPT
   // subscription gets OpenAI models without any configuration.
@@ -114,50 +153,26 @@ export function resolveModel(
   const table = models.pi.models[Object.hasOwn(models.pi.models, provider) ? provider : models.pi.fallback];
   const id = sheet?.piModels.get(requested) ?? table[requested];
   if (!id) {
-    throw new Error(`No Pi model mapped for "${requested}": add a "pi models: ${requested}=<provider>/<id>" line to the override sheet.`);
+    throw new InvalidValueError(`No Pi model mapped for "${requested}": add a "pi models: ${requested}=<provider>/<id>" line to the override sheet.`);
   }
   return id;
 }
 
 export const GENERAL_PURPOSE = "general-purpose";
 
-interface AgentDefinition {
+export interface AgentDefinition {
+  // The agent file it was read from; general-purpose has none.
+  file?: string;
+  // When to use it, as the agent tool's type list shows it.
+  description?: string;
   body: string;
   model?: string;
-  effort?: Effort;
+  effort?: string;
 }
 
-export function frontmatter(text: string): { fields: Map<string, string>; body: string } {
-  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?([\s\S]*)$/.exec(text);
-  const fields = new Map<string, string>();
-  for (const line of (m?.[1] ?? "").split(/\r?\n/)) {
-    const kv = /^([\w-]+):\s*(.*)$/.exec(line);
-    if (kv) fields.set(kv[1], kv[2].trim());
-  }
-  return { fields, body: (m?.[2] ?? text).trim() };
-}
-
-function parseAgentFile(type: string, text: string): AgentDefinition {
-  const { fields, body } = frontmatter(text);
-  const named = fields.get("effort");
-  const effort = EFFORT_LEVELS.find((level) => level === named);
-  if (named !== undefined && !effort) {
-    throw new Error(`${type}: effort "${named}" is not one of ${EFFORT_LEVELS.join(", ")}`);
-  }
-  return { body, model: fields.get("model") || undefined, effort };
-}
-
-// Claude Code registers each plugin agent file as pstack:<file name>, beside
-// the built-in general-purpose type, which has no agent file.
-export function loadAgentTypes(pluginRoot: string): Map<string, AgentDefinition> {
-  const types = new Map<string, AgentDefinition>([[GENERAL_PURPOSE, { body: "" }]]);
-  for (const dir of ["agents", "effort-agents"]) {
-    const full = join(pluginRoot, dir);
-    if (!existsSync(full)) continue;
-    for (const file of readdirSync(full).filter((f) => f.endsWith(".md")).sort()) {
-      const type = `pstack:${basename(file, ".md")}`;
-      types.set(type, parseAgentFile(type, readFileSync(join(full, file), "utf8")));
-    }
-  }
-  return types;
+// The agent tool's effort parameter: one of models.json's levels.
+export function checkEffort(effort: string, settings: Pick<Settings, "modelsFile">): string {
+  const { efforts } = readModels(settings.modelsFile);
+  if (!efforts.includes(effort)) throw new InvalidValueError(`effort "${effort}" is not one of ${efforts.join(", ")}`);
+  return effort;
 }
