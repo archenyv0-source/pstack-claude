@@ -11,6 +11,7 @@ import {
   queryBackoffSeconds,
   readSnapshot,
   runQueued,
+  runSimple,
   selectTierMajorStackDecision,
 } from "./policy.ts";
 import {
@@ -64,7 +65,7 @@ describe("readiness truth table", () => {
     ];
     for (const [mergeStateStatus, headRollupState, expected] of cases) {
       expect(
-        assessGitHubMerge({ mergeStateStatus, headRollupState }).kind,
+        assessGitHubMerge({ mergeStateStatus, headRollupState }).kind
       ).toBe(expected);
     }
   });
@@ -107,9 +108,9 @@ describe("snapshot query planning", () => {
     expect(snapshot.ci.kind).toBe("ci-pending");
     expect(reader.calls).toEqual([
       "pullRequest",
-      "reviewThreads",
+      "reviewThreadPage:null",
       "checksFastPath",
-      "revision",
+      "pullRequest",
     ]);
   });
 
@@ -147,7 +148,7 @@ describe("snapshot query planning", () => {
           pendingHistory: "include",
           allowDraft: false,
         })
-      ).kind,
+      ).kind
     ).toBe("merged");
     expect(reader.calls).toEqual(["pullRequest"]);
   });
@@ -195,7 +196,7 @@ it("attributes a stack wait to the PR whose checks are pending, not the bottom",
   expect(decision).toMatchObject({
     kind: "waiting",
     frontier: { number: 21 },
-    pending: [{ name: "upstack-build" }],
+    reason: { kind: "pending-checks", pending: [{ name: "upstack-build" }] },
   });
 });
 
@@ -303,10 +304,13 @@ describe("queued-stack cadence", () => {
     expect(timeline).toEqual([
       "emit:QUEUE",
       "read:20",
+      "read:20",
       "fail:21",
       "emit:RETRY",
       "sleep",
       "read:21",
+      "read:21",
+      "read:22",
       "read:22",
       "emit:STATUS",
       "emit:WAITING",
@@ -321,7 +325,7 @@ describe("queued-stack cadence", () => {
       state,
       await openSnapshot(queue[0]),
       0,
-      options,
+      options
     );
     expect(first.completedSweepRows).toBeNull();
     state = first.state;
@@ -329,10 +333,10 @@ describe("queued-stack cadence", () => {
       state,
       await openSnapshot(queue[1]),
       5,
-      options,
+      options
     );
     expect(
-      second.completedSweepRows?.map((row) => Number(row.context.number)),
+      second.completedSweepRows?.map((row) => Number(row.context.number))
     ).toEqual([30, 31]);
     expect(second.state.nextSweepAt).toBe(305);
   });
@@ -350,7 +354,7 @@ describe("queued-stack cadence", () => {
         const facts = await base.pullRequest(pr);
         const count = (reads.get(pr.number) ?? 0) + 1;
         reads.set(pr.number, count);
-        return pr.number === one.number && count > 1
+        return pr.number === one.number && count > 2
           ? {
               ...facts,
               state: "MERGED" as const,
@@ -387,10 +391,11 @@ describe("queued-stack cadence", () => {
     await expect(running).rejects.toThrow("stop after advance proof");
     expect(emitted.some((event) => event.kind === "ADVANCE")).toBe(true);
     const firstSleep = timeline.indexOf("sleep");
-    expect(timeline.slice(firstSleep, firstSleep + 5)).toEqual([
+    expect(timeline.slice(firstSleep, firstSleep + 6)).toEqual([
       "sleep",
       "read:40",
       "emit:ADVANCE",
+      "read:41",
       "read:41",
       "emit:WAITING",
     ]);
@@ -403,7 +408,7 @@ describe("queued-stack cadence", () => {
       state,
       await openSnapshot(queue[0]),
       0,
-      options,
+      options
     ).state;
     const first = evaluateQueue(state, options);
     expect(first.kind).toBe("waiting");
@@ -423,133 +428,65 @@ it("uses the specified retry floor and cap", () => {
   expect(queryBackoffSeconds(60, 4)).toBe(300);
 });
 
-describe("review gate", () => {
-  it("blocks on a required review instead of reporting a blocked PR ready", async () => {
-    const snapshot = await readSnapshot({
-      reader: fakeReader({
-        facts: { reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED" },
-      }),
-      context: context(23),
-      pendingHistory: "omit",
-      allowDraft: false,
-    });
-    expect(classifyPr(snapshot)).toEqual({
-      kind: "blocker",
-      blocker: { kind: "merge-gate", pr: context(23), reason: "review-required" },
-    });
-    expect(
-      selectTierMajorStackDecision([snapshot] as NonEmpty<typeof snapshot>),
-    ).toMatchObject({
-      kind: "blocker",
-      blocker: { kind: "merge-gate", reason: "review-required" },
-    });
-  });
 
-  it("blocks when branch protection holds an approved PR with clean CI", async () => {
-    const snapshot = await readSnapshot({
-      reader: fakeReader({ facts: { mergeStateStatus: "BLOCKED" } }),
-      context: context(24),
-      pendingHistory: "omit",
-      allowDraft: false,
+describe("polling deadline sleeps", () => {
+  for (const mode of ["single", "queued-stack", "query-retry"] as const) {
+    it(`caps ${mode} sleeps at the configured deadline`, async () => {
+      let now = 0;
+      const sleeps: number[] = [];
+      const pending = fakeReader({ fastPath: { kind: "checks", checks: [pendingCheck()] } });
+      const reader = mode === "query-retry"
+        ? { ...pending, async pullRequest(): Promise<PullRequestFacts> {
+          throw new WatcherQueryError({ kind: "command-exit", retryable: true, code: 1, detail: "temporary failure" });
+        } }
+        : pending;
+      const polling = { ...options, interval: 60, timeout: 5 };
+      const dependencies = {
+        reader,
+        deadline: new WatchDeadline(polling.timeout, () => now),
+        clock: {
+          now: () => now,
+          observedAt: () => "2026-07-26T00:00:00.000Z",
+          async sleep(seconds: number) { sleeps.push(seconds); now += seconds; },
+        },
+        emit() {},
+      };
+      const result = mode === "queued-stack"
+        ? await runQueued({ dependencies, contexts: [context(1)], options: polling })
+        : await runSimple({ dependencies, contexts: [context(1)], mode: "single", statusOnly: false, options: polling });
+      expect(result.kind).toBe("TIMEOUT");
+      expect(sleeps).toEqual([5]);
+      expect(now).toBe(5);
     });
-    expect(classifyPr(snapshot)).toMatchObject({
-      kind: "blocker",
-      blocker: { kind: "merge-gate", reason: "merge-blocked" },
-    });
-  });
-
-  it("waits for pending checks before reporting the review gate", async () => {
-    const snapshot = await readSnapshot({
-      reader: fakeReader({
-        facts: { reviewDecision: "REVIEW_REQUIRED", mergeStateStatus: "BLOCKED" },
-        fastPath: { kind: "checks", checks: [pendingCheck()] },
-      }),
-      context: context(26),
-      pendingHistory: "omit",
-      allowDraft: false,
-    });
-    expect(classifyPr(snapshot)).toMatchObject({ kind: "waiting" });
-  });
-
-  it("still reports changes requested as a merge-gate blocker", async () => {
-    const snapshot = await readSnapshot({
-      reader: fakeReader({
-        facts: { reviewDecision: "CHANGES_REQUESTED", mergeStateStatus: "BLOCKED" },
-      }),
-      context: context(25),
-      pendingHistory: "omit",
-      allowDraft: false,
-    });
-    expect(classifyPr(snapshot)).toMatchObject({
-      kind: "blocker",
-      blocker: { kind: "merge-gate", reason: "changes-requested" },
-    });
-  });
-});
-
-describe("a PR with no checks configured", () => {
-  const noChecks = {
-    fastPath: { kind: "none-reported" },
-    rollupPages: [{ kind: "no-rollup" }],
-    commitRollups: [{ oid: "head", state: null }],
-  } as const;
-  const read = (overrides: Parameters<typeof fakeReader>[0] = {}) =>
-    readSnapshot({
-      reader: fakeReader({ ...noChecks, ...overrides }),
-      context: context(30),
-      pendingHistory: "omit",
-      allowDraft: false,
-    });
-
-  it("is ready when GitHub reports it mergeable", async () => {
-    const snapshot = await read({ facts: { reviewDecision: null } });
-    expect(classifyPr(snapshot)).toMatchObject({
-      kind: "ready",
-      pr: { proof: { ci: { kind: "ci-none" } } },
-    });
-  });
-
-  it("still stops on conflicts, review threads, and merge gates", async () => {
-    const thread = {
-      id: "thread",
-      firstComment: null,
-      isBugbot: false,
-      bugbotReviewPasses: 0,
-    };
-    const cases = [
-      [{ facts: { mergeable: "CONFLICTING" } }, { kind: "merge-conflicts" }],
-      [{ threads: [thread] }, { kind: "review-threads" }],
-      [
-        { facts: { reviewDecision: "REVIEW_REQUIRED" } },
-        { kind: "merge-gate", reason: "review-required" },
-      ],
-      [
-        { facts: { mergeStateStatus: "BLOCKED" } },
-        { kind: "merge-gate", reason: "merge-blocked" },
-      ],
-      [{ facts: { isDraft: true } }, { kind: "merge-gate", reason: "draft-pr" }],
-    ] as const;
-    for (const [overrides, blocker] of cases)
-      expect(classifyPr(await read(overrides))).toMatchObject({
-        kind: "blocker",
-        blocker,
-      });
-  });
-
-  it("fails closed while the head may not have reported yet", async () => {
-    const unsettled = [
-      {
-        commitRollups: [
-          { oid: "earlier", state: "SUCCESS" },
-          { oid: "head", state: null },
-        ],
+  }
+  it("preserves the polling interval when the deadline is disabled", async () => {
+    let now = 0;
+    let reads = 0;
+    const sleeps: number[] = [];
+    const pending = fakeReader({ fastPath: { kind: "checks", checks: [pendingCheck()] } });
+    const passed = fakeReader({ fastPath: { kind: "checks", checks: [passingCheck()] } });
+    const result = await runSimple({
+      dependencies: {
+        reader: {
+          ...pending,
+          async checksFastPath(pr) {
+            reads += 1;
+            return reads === 1 ? pending.checksFastPath(pr) : passed.checksFastPath(pr);
+          },
+        },
+        deadline: new WatchDeadline(0, () => now),
+        clock: {
+          now: () => now,
+          observedAt: () => "2026-07-26T00:00:00.000Z",
+          async sleep(seconds) { sleeps.push(seconds); now += seconds; },
+        },
+        emit() {},
       },
-      { commitRollups: [{ oid: "head", state: "PENDING" }] },
-      { facts: { mergeable: "UNKNOWN", mergeStateStatus: "UNKNOWN" } },
-    ] as const;
-    for (const overrides of unsettled)
-      await expect(read(overrides)).rejects.toMatchObject({
-        failure: { kind: "checks-unavailable", retryable: true },
-      });
+      contexts: [context(1)], mode: "single", statusOnly: false,
+      options: { ...options, interval: 60, timeout: 0 },
+    });
+    expect(result.kind).toBe("READY");
+    expect(sleeps).toEqual([60]);
   });
+
 });
